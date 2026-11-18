@@ -315,6 +315,8 @@ fn sil_opcode_builtins_resolve() {
         "OpNum2Bin",
         "OpBin2Num",
         "OpChainblockSeqCommit",
+        "r0_g16_verify",
+        "r0_succinct_verify",
     ] {
         load_inline_program(PathBuf::from("sil-opcode.ag"), format!("const int VALUE = {name}(0);"))
             .unwrap_or_else(|error| panic!("{name} should resolve: {error}"));

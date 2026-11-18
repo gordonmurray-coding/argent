@@ -74,6 +74,17 @@ struct EntryCoSpentAstLowerer<'c, 'n, 'm, 'src> {
     error: Option<ArgentError>,
 }
 
+/// Silverscript builtins whose names Argent cannot spell (they contain dots) are
+/// written under an alias and renamed here, at the one place entry bodies are
+/// lowered. Silverscript then types the call as its own builtin.
+pub(super) fn sil_builtin_name(name: &str) -> &str {
+    match name {
+        "r0_g16_verify" => "r0.g16.verify",
+        "r0_succinct_verify" => "r0.succinct.verify",
+        other => other,
+    }
+}
+
 impl<'ast> AstVisitorMut<'ast> for EntryCoSpentAstLowerer<'_, '_, '_, '_> {
     fn visit_expr(&mut self, expr: &mut Expr<'ast>) {
         if let ExprKind::FieldAccess { source, field, .. } = &expr.kind
@@ -95,7 +106,27 @@ impl<'ast> AstVisitorMut<'ast> for EntryCoSpentAstLowerer<'_, '_, '_, '_> {
         {
             *name = "byte[32]".to_string();
         }
+        if let ExprKind::Call { name, name_span, .. } = &mut expr.kind
+            && self.lowerer.names.is_builtin(*name_span)
+        {
+            let aliased = sil_builtin_name(name);
+            if aliased != name {
+                *name = aliased.to_string();
+            }
+        }
         walk_expr_mut(self, expr);
+    }
+
+    fn visit_statement(&mut self, statement: &mut Statement<'ast>) {
+        if let Statement::FunctionCall { name, name_span, .. } = statement
+            && self.lowerer.names.is_builtin(*name_span)
+        {
+            let aliased = sil_builtin_name(name);
+            if aliased != name {
+                *name = aliased.to_string();
+            }
+        }
+        walk_statement_mut(self, statement);
     }
 }
 

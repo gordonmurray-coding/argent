@@ -206,6 +206,8 @@ impl DeclarationBinder<'_, '_> {
                 | "OpNum2Bin"
                 | "OpBin2Num"
                 | "OpChainblockSeqCommit"
+                | "r0_g16_verify"
+                | "r0_succinct_verify"
         ) || name.starts_with("__as_cast_")
             || (name.contains('[')
                 && sil::parse_type_ref(name)
