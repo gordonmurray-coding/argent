@@ -306,6 +306,9 @@ pub struct TxContext<'a> {
     pub subnetwork_id: SubnetworkId,
     pub gas: u64,
     pub payload: Vec<u8>,
+    /// KIP-21 sequencing commitments (block hash → `accepted_id_merkle_root`) served to
+    /// `OpChainblockSeqCommit` when the built transaction is executed locally.
+    pub seq_commits: std::collections::BTreeMap<kaspa_consensus_core::Hash, kaspa_consensus_core::Hash>,
 }
 
 impl<'a> TxContext<'a> {
@@ -316,6 +319,13 @@ impl<'a> TxContext<'a> {
     /// Set the transaction lock time.
     pub fn lock_time(mut self, lock_time: u64) -> Self {
         self.lock_time = lock_time;
+        self
+    }
+
+    /// Serve KIP-21 sequencing commitments (block hash → `accepted_id_merkle_root`) to
+    /// `OpChainblockSeqCommit` when the built transaction is executed locally.
+    pub fn seq_commits(mut self, seq_commits: std::collections::BTreeMap<kaspa_consensus_core::Hash, kaspa_consensus_core::Hash>) -> Self {
+        self.seq_commits = seq_commits;
         self
     }
 

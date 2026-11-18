@@ -44,8 +44,8 @@ use kaspa_consensus_core::{
     },
 };
 use kaspa_txscript::{
-    EngineCtx, EngineFlags, SigCacheKey, TxScriptEngine, caches::Cache, covenants::CovenantsContext, pay_to_script_hash_script,
-    script_builder::ScriptBuilderError,
+    EngineCtx, EngineFlags, SeqCommitAccessor, SigCacheKey, TxScriptEngine, caches::Cache, covenants::CovenantsContext,
+    pay_to_script_hash_script, script_builder::ScriptBuilderError,
 };
 use kaspa_txscript_errors::TxScriptError;
 use silverscript_abi::{CodecError, decode_hex, encode_struct_payload};
@@ -1880,12 +1880,39 @@ pub fn execute_input_with_covenants(tx: &Transaction, entries: Vec<UtxoEntry>, i
     let sig_cache = Cache::new(100);
     let populated = PopulatedTransaction::new(tx, entries);
     let cov_ctx = CovenantsContext::from_tx(&populated).map_err(TxScriptError::from)?;
-    measure_input_script_units_with_covenants(&populated, input_idx, &sig_cache, &reused_values, &cov_ctx).map(|_| ())
+    measure_input_script_units_with_covenants(&populated, input_idx, &sig_cache, &reused_values, &cov_ctx, None).map(|_| ())
+}
+
+/// KIP-21 sequencing commitments served to `OpChainblockSeqCommit` while a transaction is built or
+/// executed locally: block hash → that block's `accepted_id_merkle_root`. A block missing from the
+/// map fails the opcode, as consensus fails a block that is not on the selected chain within
+/// finality depth. Serve the real header values so a covenant that reads a commitment is checked
+/// against what the node will see.
+#[derive(Clone, Debug, Default)]
+pub struct MapSeqCommitAccessor(pub BTreeMap<Hash, Hash>);
+
+impl SeqCommitAccessor for MapSeqCommitAccessor {
+    fn is_chain_ancestor_from_pov(&self, block_hash: Hash) -> Option<bool> {
+        Some(self.0.contains_key(&block_hash))
+    }
+
+    fn seq_commitment_within_depth(&self, block_hash: Hash) -> Option<Hash> {
+        self.0.get(&block_hash).copied()
+    }
 }
 
 /// Execute every covenant input, commit its measured compute budget, and check
 /// the finalized transaction against the consensus non-contextual mass limits.
 pub fn execute_transaction_with_covenants(tx: &mut Transaction, entries: Vec<UtxoEntry>) -> BuilderResult<()> {
+    execute_transaction_with_covenants_with_seq_commits(tx, entries, None)
+}
+
+/// `execute_transaction_with_covenants` with sequencing commitments served to `OpChainblockSeqCommit`.
+pub fn execute_transaction_with_covenants_with_seq_commits(
+    tx: &mut Transaction,
+    entries: Vec<UtxoEntry>,
+    seq_commits: Option<&dyn SeqCommitAccessor>,
+) -> BuilderResult<()> {
     if tx.version != TX_VERSION_TOCCATA {
         return Err(BuilderError::UnsupportedTransactionVersion { expected: TX_VERSION_TOCCATA, found: tx.version });
     }
@@ -1901,7 +1928,7 @@ pub fn execute_transaction_with_covenants(tx: &mut Transaction, entries: Vec<Utx
         let mut used_script_units = Vec::with_capacity(tx.inputs.len());
         for input_index in 0..tx.inputs.len() {
             let script_units =
-                measure_input_script_units_with_covenants(&populated, input_index, &sig_cache, &reused_values, &cov_ctx)
+                measure_input_script_units_with_covenants(&populated, input_index, &sig_cache, &reused_values, &cov_ctx, seq_commits)
                     .map_err(|source| BuilderError::InputScript { input_index, source })?;
             used_script_units.push(script_units);
         }
@@ -1932,6 +1959,7 @@ fn measure_input_script_units_with_covenants(
     sig_cache: &Cache<SigCacheKey, bool>,
     reused_values: &SigHashReusedValuesUnsync,
     cov_ctx: &CovenantsContext,
+    seq_commits: Option<&dyn SeqCommitAccessor>,
 ) -> Result<ScriptUnits, TxScriptError> {
     let input = populated.tx.inputs[input_idx].clone();
     let utxo = populated.utxo(input_idx).expect("selected input utxo");
@@ -1941,7 +1969,7 @@ fn measure_input_script_units_with_covenants(
         &input,
         input_idx,
         utxo,
-        EngineCtx::new(sig_cache).with_reused(reused_values).with_covenants_ctx(cov_ctx),
+        EngineCtx::new(sig_cache).with_reused(reused_values).with_covenants_ctx(cov_ctx).with_seq_commit_accessor_opt(seq_commits),
         covenant_engine_flags(),
         ScriptUnits(u64::MAX),
     );
@@ -2085,6 +2113,39 @@ mod tests {
         let expected = vec![ArgValue::Value(ArtifactValue::Array(Vec::new()))];
         assert_eq!(args![states.as_slice()], expected);
         assert_eq!(args![states], expected);
+    }
+
+    #[test]
+    fn transaction_execution_serves_seq_commits_to_the_opcode() {
+        use kaspa_txscript::opcodes::codes::{OpChainblockSeqCommit, OpEqual};
+        use kaspa_txscript::script_builder::ScriptBuilder;
+        let block = kaspa_consensus_core::Hash::from_bytes([0xb1; 32]);
+        let commit = kaspa_consensus_core::Hash::from_bytes([0xc1; 32]);
+        let script = ScriptBuilder::new()
+            .add_data(block.as_bytes().as_slice())
+            .unwrap()
+            .add_op(OpChainblockSeqCommit)
+            .unwrap()
+            .add_data(commit.as_bytes().as_slice())
+            .unwrap()
+            .add_op(OpEqual)
+            .unwrap()
+            .drain();
+        let outpoint = TransactionOutpoint::new(TransactionId::from_bytes([0x34; 32]), 0);
+        let input = TransactionInput::new_with_compute_budget(outpoint, Vec::new(), 0, 0);
+        let mut transaction = Transaction::new(TX_VERSION_TOCCATA, vec![input], Vec::new(), 0, Default::default(), 0, Vec::new());
+        let utxo = UtxoEntry::new(1_000, ScriptPublicKey::new(0, script.into()), 0, false, None);
+
+        // without a served commitment the opcode is not enabled, as consensus treats an off-chain block
+        let error = execute_transaction_with_covenants(&mut transaction.clone(), vec![utxo.clone()]).expect_err("no accessor");
+        assert!(matches!(error, BuilderError::InputScript { input_index: 0, .. }), "{error:?}");
+
+        let served = MapSeqCommitAccessor(BTreeMap::from([(block, commit)]));
+        execute_transaction_with_covenants_with_seq_commits(&mut transaction.clone(), vec![utxo.clone()], Some(&served))
+            .expect("served commitment satisfies the script");
+
+        let wrong = MapSeqCommitAccessor(BTreeMap::from([(block, kaspa_consensus_core::Hash::from_bytes([0xd1; 32]))]));
+        execute_transaction_with_covenants_with_seq_commits(&mut transaction, vec![utxo], Some(&wrong)).expect_err("mismatch fails");
     }
 
     #[test]

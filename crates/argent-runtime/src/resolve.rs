@@ -18,7 +18,7 @@ use crate::{
     ActorInput, ActorPath, Artifact, ArtifactValue, BuilderError, BuilderResult, ContextInput, ContextOutput, ContractRef, EntryArgs,
     HiddenArgContexts, InputSigScript, ObservedCovenantContext, ObservedInput, ObservedOutput, OrdinaryInput, OutputCovenant,
     OutputOwner, OutputState, Side, SpawnedActorContext, StateContext, TxBuilder, TxContext, artifact_app_alias,
-    covenant_engine_flags, execute_transaction_with_covenants,
+    MapSeqCommitAccessor, covenant_engine_flags, execute_transaction_with_covenants_with_seq_commits,
 };
 
 type ResolvedObservations = BTreeMap<String, ObservedCovenantContext>;
@@ -665,6 +665,7 @@ impl<'artifact> TxBuilder<'artifact> {
     /// Artifact-local routes and concrete observed actors supply all
     /// compiler-generated witness arguments.
     pub fn build(&self, context: &TxContext<'_>) -> BuilderResult<Transaction> {
+        let seq_commits = MapSeqCommitAccessor(context.seq_commits.clone());
         let mut context = self.bind_context(context)?;
         let unsigned = self.unsigned_transaction(&context)?;
         self.validate_leader_actor_input_counts(&context)?;
@@ -716,7 +717,7 @@ impl<'artifact> TxBuilder<'artifact> {
         }
         let entries =
             unsigned.entries.into_iter().map(|entry| entry.expect("context transaction inputs always carry UTXO entries")).collect();
-        execute_transaction_with_covenants(&mut transaction, entries)?;
+        execute_transaction_with_covenants_with_seq_commits(&mut transaction, entries, Some(&seq_commits))?;
         Ok(transaction)
     }
 }
